@@ -6,7 +6,6 @@
 <title>BUSHIDO STORE — Arts Martiaux & Combat</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@400;600;700&family=Barlow+Condensed:wght@400;600;700&display=swap" rel="stylesheet">
 <script src="https://js.stripe.com/v3/"></script>
-<script src="https://www.paypal.com/sdk/js?client-id=BAATa9rAGFEqvKg7SVh_bZg4WyeRPTkB5zRL2UV5hChWENKA59cS_x2Qnbgd6WwHygDdiuj5SrmQ6powts&currency=EUR&intent=capture"></script>
 <style>
 :root{
   --gold:#C9A84C;--gold-l:#E8C97A;--gold-d:#8B6914;
@@ -703,13 +702,11 @@ section.active{display:block}
       <div class="pmth pmth-amex" onclick="selMethod('amex',this)"><svg width="72" height="18" viewBox="0 0 90 22"><rect width="90" height="22" rx="3" fill="#007BC1"/><text x="5" y="16" font-family="Arial" font-weight="900" font-size="13" fill="white">AMEX</text></svg></div>
     </div>
     <div class="pay-panel on" id="panel-paypal">
-      <div style="background:var(--dark2);border:1px solid rgba(0,112,186,.3);border-radius:8px;padding:24px">
-        <div style="font-family:'Barlow Condensed',sans-serif;font-size:15px;font-weight:700;color:var(--white);margin-bottom:16px;letter-spacing:1px;text-align:center">🅿️ Payer avec PayPal</div>
-        <div class="fg"><label class="fl">Nom</label><input class="fi" type="text" id="paypal-name" placeholder="JEAN DUPONT" style="text-transform:uppercase"></div>
-        <div class="fg"><label class="fl">Email</label><input class="fi" type="email" id="paypal-email" placeholder="votre@email.com"></div>
-        <div id="paypal-btn-container" style="margin-top:14px"></div>
-        <div id="paypal-error" style="color:var(--red);font-size:12px;margin-top:8px;min-height:18px"></div>
-        <div class="stripe-badge" style="margin-top:10px;font-size:11px;color:var(--muted);text-align:center">Paiement sécurisé par PayPal</div>
+      <div style="background:var(--dark2);border:1px solid rgba(0,112,186,.3);border-radius:8px;padding:24px;text-align:center">
+        <div style="font-size:40px;margin-bottom:12px">🅿️</div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:700;color:var(--white);margin-bottom:6px">Payer avec PayPal</div>
+        <div style="font-size:13px;color:var(--muted);margin-bottom:20px">Vous serez redirigé vers PayPal pour finaliser votre paiement.</div>
+        <a class="ext-pay-btn paypal-btn" href="https://www.paypal.com/ncp/payment/LZ7EX2VH82TEU" target="_blank" onclick="showToast('🅿️','Redirection vers PayPal...')">PayPal — Payer <span id="pp-amt">0,00 €</span></a>
       </div>
     </div>
     <div class="pay-panel" id="panel-visa">
@@ -1599,53 +1596,6 @@ async function stripeConfirmPay(){
 }
 
 /* ══════════════════════════════════════════════
-   PAYPAL
-══════════════════════════════════════════════ */
-let paypalButtonsRendered=false;
-function initPaypalButtons(){
-  if(paypalButtonsRendered||typeof paypal==='undefined')return;
-  const container=document.getElementById('paypal-btn-container');
-  if(!container)return;
-  paypalButtonsRendered=true;
-  paypal.Buttons({
-    style:{layout:'vertical',color:'gold',shape:'rect',label:'paypal'},
-    createOrder:async function(){
-      const errEl=document.getElementById('paypal-error');errEl.textContent='';
-      if(!cart.length){errEl.textContent='Votre panier est vide';throw new Error('Panier vide');}
-      const email=document.getElementById('paypal-email')?.value;
-      const name=document.getElementById('paypal-name')?.value;
-      if(!email){errEl.textContent='Renseignez votre email';throw new Error('Email requis');}
-      const sub=cart.reduce((s,i)=>s+i.price*i.qty,0);
-      const total=sub*(1-promoDiscount);
-      const articles=cart.map(i=>i.name+(i.size?' '+i.size:'')).join(', ');
-      const res=await fetch('/api/paypal/create-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount:total,email,name,articles})});
-      const data=await res.json();
-      if(!data.id){errEl.textContent=data.error||'Erreur lors de la création de la commande';throw new Error(data.error||'Erreur PayPal');}
-      return data.id;
-    },
-    onApprove:async function(data){
-      const errEl=document.getElementById('paypal-error');
-      try{
-        const res=await fetch('/api/paypal/capture-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderID:data.orderID})});
-        const result=await res.json();
-        if(result.error){errEl.textContent=result.error;showToast('❌',result.error);return;}
-        const capture=result.purchase_units?.[0]?.payments?.captures?.[0];
-        const amount=capture?parseFloat(capture.amount.value):(cart.reduce((s,i)=>s+i.price*i.qty,0)*(1-promoDiscount));
-        addOrderToMember(capture?capture.id:data.orderID,amount);
-        showToast('✅','Paiement PayPal confirmé ! 🎉');
-        cart=[];promoDiscount=0;syncCart();
-        setTimeout(()=>show('inscription'),1800);
-      }catch(e){errEl.textContent='Erreur : '+e.message;showToast('❌',e.message);}
-    },
-    onError:function(err){
-      const errEl=document.getElementById('paypal-error');
-      errEl.textContent='Erreur PayPal, réessayez.';
-      console.error('PayPal error:',err);
-    }
-  }).render('#paypal-btn-container');
-}
-
-/* ══════════════════════════════════════════════
    MEMBRE / AUTH — VRAIE API + JWT
 ══════════════════════════════════════════════ */
 let currentUser=null;
@@ -1927,8 +1877,8 @@ function addOrderToMember(paymentId,total){
 /* ══════════════════════════════════════════════
    PAIEMENT
 ══════════════════════════════════════════════ */
-function selMethod(m,el){curMethod=m;document.querySelectorAll('.pmth').forEach(b=>b.classList.remove('on'));el.classList.add('on');document.querySelectorAll('.pay-panel').forEach(p=>p.classList.remove('on'));document.getElementById('panel-'+m).classList.add('on');if(m==='visa')setTimeout(initStripe,100);if(m==='paypal')setTimeout(initPaypalButtons,100);}
-function buildPayRec(){const sub=cart.reduce((s,i)=>s+i.price*i.qty,0);const tot=sub*(1-promoDiscount);const fmt=v=>v.toFixed(2).replace('.',',')+' €';const items=cart.map(i=>`<div class="or-i"><span>${i.name}${i.size?' ('+i.size+')':''} ×${i.qty}</span><span>${(i.price*i.qty).toFixed(2).replace('.',',')} €</span></div>`).join('');document.getElementById('payRecap').innerHTML=`<div class="or-title">VOTRE COMMANDE</div>${items||'<div class="or-i"><span style="color:var(--muted)">Panier vide</span></div>'}<div class="or-tot"><span>Total</span><span class="amt">${fmt(tot)}</span></div>`;syncTotals();setTimeout(initStripe,200);setTimeout(initPaypalButtons,200);if(currentUser){const em=document.getElementById('stripe-email');const nm=document.getElementById('stripe-name');if(em)em.value=currentUser.email;if(nm)nm.value=((currentUser.prenom||'')+(currentUser.nom?' '+currentUser.nom:'')).toUpperCase();const pem=document.getElementById('paypal-email');const pnm=document.getElementById('paypal-name');if(pem)pem.value=currentUser.email;if(pnm)pnm.value=((currentUser.prenom||'')+(currentUser.nom?' '+currentUser.nom:'')).toUpperCase();}}
+function selMethod(m,el){curMethod=m;document.querySelectorAll('.pmth').forEach(b=>b.classList.remove('on'));el.classList.add('on');document.querySelectorAll('.pay-panel').forEach(p=>p.classList.remove('on'));document.getElementById('panel-'+m).classList.add('on');if(m==='visa')setTimeout(initStripe,100);}
+function buildPayRec(){const sub=cart.reduce((s,i)=>s+i.price*i.qty,0);const tot=sub*(1-promoDiscount);const fmt=v=>v.toFixed(2).replace('.',',')+' €';const items=cart.map(i=>`<div class="or-i"><span>${i.name}${i.size?' ('+i.size+')':''} ×${i.qty}</span><span>${(i.price*i.qty).toFixed(2).replace('.',',')} €</span></div>`).join('');document.getElementById('payRecap').innerHTML=`<div class="or-title">VOTRE COMMANDE</div>${items||'<div class="or-i"><span style="color:var(--muted)">Panier vide</span></div>'}<div class="or-tot"><span>Total</span><span class="amt">${fmt(tot)}</span></div>`;syncTotals();setTimeout(initStripe,200);if(currentUser){const em=document.getElementById('stripe-email');const nm=document.getElementById('stripe-name');if(em)em.value=currentUser.email;if(nm)nm.value=((currentUser.prenom||'')+(currentUser.nom?' '+currentUser.nom:'')).toUpperCase();}}
 
 /* ══════════════════════════════════════════════
    TOAST
