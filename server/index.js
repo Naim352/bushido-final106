@@ -14,29 +14,6 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ══════════════════════════════════════════════
-// PAYPAL
-// ══════════════════════════════════════════════
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
-const PAYPAL_SECRET    = process.env.PAYPAL_SECRET;
-// Sandbox : https://api-m.sandbox.paypal.com — Live : https://api-m.paypal.com
-const PAYPAL_API = process.env.PAYPAL_API_BASE || 'https://api-m.sandbox.paypal.com';
-
-async function getPayPalToken() {
-  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
-  const r = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
-  });
-  if (!r.ok) throw new Error('Impossible d\'obtenir un token PayPal');
-  const data = await r.json();
-  return data.access_token;
-}
-
-// ══════════════════════════════════════════════
 // EMAIL — Notifications via Resend (API HTTPS)
 // ⚠️ On n'utilise PAS Gmail/SMTP : Railway bloque les ports
 // SMTP sortants (465/587) sur les plans Free/Hobby. Resend
@@ -128,8 +105,6 @@ async function setupDatabase() {
         id              SERIAL PRIMARY KEY,
         client_id       INTEGER REFERENCES clients(id) ON DELETE CASCADE,
         stripe_id       VARCHAR(255),
-        paypal_id       VARCHAR(255),
-        methode_paiement VARCHAR(20) DEFAULT 'stripe',
         montant         DECIMAL(10,2) NOT NULL,
         articles        TEXT,
         statut          VARCHAR(50) DEFAULT 'En traitement',
@@ -138,9 +113,6 @@ async function setupDatabase() {
       CREATE INDEX IF NOT EXISTS idx_clients_email ON clients(email);
       CREATE INDEX IF NOT EXISTS idx_commandes_client ON commandes(client_id);
       CREATE INDEX IF NOT EXISTS idx_commandes_stripe ON commandes(stripe_id);
-      CREATE INDEX IF NOT EXISTS idx_commandes_paypal ON commandes(paypal_id);
-      ALTER TABLE commandes ADD COLUMN IF NOT EXISTS paypal_id VARCHAR(255);
-      ALTER TABLE commandes ADD COLUMN IF NOT EXISTS methode_paiement VARCHAR(20) DEFAULT 'stripe';
     `);
     console.log('✅ Tables vérifiées/créées avec succès');
   } catch (err) {
@@ -152,15 +124,7 @@ async function setupDatabase() {
 // MIDDLEWARES
 // ══════════════════════════════════════════════
 app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
-// ⚠️ CORRECTIF CRITIQUE : le webhook Stripe a besoin du corps BRUT (Buffer)
-// pour vérifier la signature. Si express.json() parse la requête avant,
-// stripe.webhooks.constructEvent() échoue systématiquement (signature invalide)
-// et la commande n'est JAMAIS enregistrée, même si le paiement a réussi.
-// On exclut donc /api/webhook du parsing JSON global.
-app.use((req, res, next) => {
-  if (req.originalUrl === '/api/webhook') return next();
-  express.json()(req, res, next);
-});
+app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
 // ── Vérifie le token JWT (middleware protégé) ──
@@ -489,167 +453,6 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
 });
 
 // ══════════════════════════════════════════════
-// PAYPAL — Créer une commande (order)
-// ══════════════════════════════════════════════
-app.post('/api/paypal/create-order', async (req, res) => {
-  const { amount, email, name, articles } = req.body;
-
-  if (!amount || amount < 0.5)
-    return res.status(400).json({ error: 'Montant invalide (minimum 0,50 €)' });
-  if (!email)
-    return res.status(400).json({ error: 'Email requis' });
-
-  try {
-    const token = await getPayPalToken();
-    const r = await fetch(`${PAYPAL_API}/v2/checkout/orders`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        intent: 'CAPTURE',
-        purchase_units: [{
-          amount: { currency_code: 'EUR', value: amount.toFixed(2) },
-          custom_id: JSON.stringify({ email, name: name || '', articles: articles || '' }).slice(0, 250),
-        }],
-      }),
-    });
-    const order = await r.json();
-    if (!r.ok) {
-      console.error('PayPal create-order error:', order);
-      return res.status(500).json({ error: 'Erreur PayPal lors de la création de commande' });
-    }
-    res.json({ id: order.id });
-  } catch (err) {
-    console.error('PayPal create-order error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════
-// PAYPAL — Capturer le paiement (confirmation côté client)
-// ══════════════════════════════════════════════
-app.post('/api/paypal/capture-order', async (req, res) => {
-  const { orderID } = req.body;
-  if (!orderID) return res.status(400).json({ error: 'orderID requis' });
-
-  try {
-    const token = await getPayPalToken();
-    const r = await fetch(`${PAYPAL_API}/v2/checkout/orders/${orderID}/capture`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      console.error('PayPal capture error:', data);
-      return res.status(500).json({ error: 'Erreur PayPal lors de la capture' });
-    }
-
-    await enregistrerCommandePaypal(data);
-
-    res.json(data);
-  } catch (err) {
-    console.error('PayPal capture-order error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Fonction commune : enregistre la commande + notifie l'admin ──
-// Utilisée par /capture-order ET par le webhook (filet de sécurité,
-// si le client ferme l'onglet juste après avoir payé).
-async function enregistrerCommandePaypal(captureData) {
-  try {
-    const unit = captureData.purchase_units?.[0];
-    const capture = unit?.payments?.captures?.[0];
-    if (!capture || capture.status !== 'COMPLETED') return;
-
-    // Évite les doublons (capture-order ET webhook peuvent tous deux appeler cette fonction)
-    const already = await db.query('SELECT id FROM commandes WHERE paypal_id=$1', [capture.id]);
-    if (already.rows.length > 0) return;
-
-    let meta = {};
-    try { meta = JSON.parse(unit.custom_id || '{}'); } catch {}
-    const email = meta.email || captureData.payer?.email_address;
-    const name  = meta.name || `${captureData.payer?.name?.given_name || ''} ${captureData.payer?.name?.surname || ''}`.trim();
-    const amount = parseFloat(capture.amount.value);
-
-    if (!email) return;
-
-    const result = await db.query('SELECT id, prenom, nom FROM clients WHERE email=$1', [email.toLowerCase()]);
-    if (result.rows.length === 0) return;
-
-    const clientId = result.rows[0].id;
-
-    await db.query(
-      `INSERT INTO commandes (client_id, paypal_id, methode_paiement, montant, articles, statut)
-       VALUES ($1, $2, 'paypal', $3, $4, 'En traitement')`,
-      [clientId, capture.id, amount, meta.articles || '']
-    );
-
-    await db.query(
-      `UPDATE clients SET total_depense = total_depense + $1, points = FLOOR(total_depense + $1)
-       WHERE id = $2`,
-      [amount, clientId]
-    );
-
-    if (process.env.ADMIN_EMAIL) {
-      const nomClient = result.rows[0].prenom ? `${result.rows[0].prenom} ${result.rows[0].nom}` : email;
-      sendMail(
-        process.env.ADMIN_EMAIL,
-        `💰 Paiement PayPal reçu : ${amount.toFixed(2)} € — ${nomClient}`,
-        `<h2>Nouveau paiement PayPal confirmé</h2>
-         <p><b>Client :</b> ${nomClient} (${email})</p>
-         <p><b>Montant :</b> ${amount.toFixed(2)} €</p>
-         <p><b>Référence PayPal :</b> ${capture.id}</p>
-         <p><b>Date :</b> ${new Date().toLocaleString('fr-FR')}</p>`
-      );
-    }
-  } catch (err) {
-    console.error('Erreur enregistrement commande PayPal:', err.message);
-  }
-}
-
-// ══════════════════════════════════════════════
-// PAYPAL — Webhook (filet de sécurité)
-// ══════════════════════════════════════════════
-app.post('/api/paypal/webhook', async (req, res) => {
-  try {
-    const token = await getPayPalToken();
-    const verif = await fetch(`${PAYPAL_API}/v1/notifications/verify-webhook-signature`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        auth_algo: req.headers['paypal-auth-algo'],
-        cert_url: req.headers['paypal-cert-url'],
-        transmission_id: req.headers['paypal-transmission-id'],
-        transmission_sig: req.headers['paypal-transmission-sig'],
-        transmission_time: req.headers['paypal-transmission-time'],
-        webhook_id: process.env.PAYPAL_WEBHOOK_ID,
-        webhook_event: req.body,
-      }),
-    });
-    const verifData = await verif.json();
-    if (verifData.verification_status !== 'SUCCESS') {
-      console.warn('Webhook PayPal : signature invalide');
-      return res.status(400).json({ error: 'Signature invalide' });
-    }
-
-    const event = req.body;
-    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-      const capture = event.resource;
-      // Reconstruit la même forme que la réponse de /capture pour réutiliser la fonction commune
-      await enregistrerCommandePaypal({
-        purchase_units: [{ custom_id: capture.custom_id, payments: { captures: [capture] } }],
-        payer: {},
-      });
-    }
-
-    res.json({ received: true });
-  } catch (err) {
-    console.error('PayPal webhook error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════
 // ADMIN — Base clients (protégée, pour toi uniquement)
 // ══════════════════════════════════════════════
 // Pour protéger ton admin, ajoute un mot de passe admin dans .env
@@ -836,10 +639,6 @@ app.get('/api/diagnostic', (req, res) => {
     ADMIN_EMAIL: process.env.ADMIN_EMAIL || '❌ MANQUANTE',
     RESEND_API_KEY: process.env.RESEND_API_KEY ? '✅ présente' : '❌ MANQUANTE',
     RESEND_FROM: process.env.RESEND_FROM || '(par défaut: onboarding@resend.dev)',
-    PAYPAL_CLIENT_ID: process.env.PAYPAL_CLIENT_ID ? '✅ présente' : '❌ MANQUANTE',
-    PAYPAL_SECRET: process.env.PAYPAL_SECRET ? '✅ présente' : '❌ MANQUANTE',
-    PAYPAL_API_BASE: process.env.PAYPAL_API_BASE || '(par défaut: sandbox)',
-    PAYPAL_WEBHOOK_ID: process.env.PAYPAL_WEBHOOK_ID ? '✅ présente' : '❌ MANQUANTE (webhook PayPal ne marchera pas)',
   });
 });
 
